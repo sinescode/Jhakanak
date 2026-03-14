@@ -1,0 +1,159 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux AMD64
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            binary_name: btc-scanner
+            asset_name: btc-scanner-linux-amd64
+          
+          # Linux ARM64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            binary_name: btc-scanner
+            asset_name: btc-scanner-linux-arm64
+          
+          # Windows AMD64 (GNU toolchain)
+          - target: x86_64-pc-windows-gnu
+            os: ubuntu-latest
+            binary_name: btc-scanner.exe
+            asset_name: btc-scanner-windows-amd64.exe
+          
+          # Android ARM64
+          - target: aarch64-linux-android
+            os: ubuntu-latest
+            binary_name: btc-scanner
+            asset_name: btc-scanner-android-arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Install cross-compilation tools
+      - name: Install dependencies (Ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libssl-dev \
+            mingw-w64 \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            libc6-dev-arm64-cross \
+            gcc-mingw-w64-x86-64-win32
+
+      # Install Android NDK for Android builds
+      - name: Setup Android NDK
+        if: matrix.target == 'aarch64-linux-android'
+        uses: android-actions/setup-android@v3
+        with:
+          ndk-version: r26b
+
+      # Setup Android toolchain
+      - name: Configure Android toolchain
+        if: matrix.target == 'aarch64-linux-android'
+        run: |
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> $GITHUB_ENV
+          echo "TARGET_CC=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang" >> $GITHUB_ENV
+          echo "TARGET_AR=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" >> $GITHUB_ENV
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang" >> $GITHUB_ENV
+
+      # Use cross for complex cross-compilations
+      - name: Install cross
+        if: matrix.target != 'x86_64-unknown-linux-gnu'
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      # Build with cross (handles OpenSSL properly)
+      - name: Build with cross
+        if: matrix.target != 'x86_64-unknown-linux-gnu'
+        run: |
+          cross build --release --target ${{ matrix.target }}
+        env:
+          CROSS_NO_WARNINGS: 0
+
+      # Native build for Linux AMD64
+      - name: Build native
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # Package the binary
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/${{ matrix.binary_name }} dist/${{ matrix.asset_name }}
+          cd dist
+          tar -czf ${{ matrix.asset_name }}.tar.gz ${{ matrix.asset_name }}
+          if [[ "${{ matrix.target }}" == *"windows"* ]]; then
+            zip ${{ matrix.asset_name }}.zip ${{ matrix.asset_name }}
+          fi
+
+      # Upload artifacts
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: |
+            dist/${{ matrix.asset_name }}
+            dist/${{ matrix.asset_name }}.tar.gz
+            dist/*.zip
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      # Download all artifacts
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: false
+
+      # List artifacts for debugging
+      - name: List artifacts
+        run: |
+          ls -la artifacts/
+          find artifacts/ -type f
+
+      # Create Release
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/**/*.zip
+            artifacts/**/btc-scanner-linux-amd64
+            artifacts/**/btc-scanner-linux-arm64
+            artifacts/**/btc-scanner-windows-amd64.exe
+            artifacts/**/btc-scanner-android-arm64
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
