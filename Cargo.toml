@@ -24,10 +24,3 @@ opt-level   = 3
 lto         = "fat"
 codegen-units = 1
 panic       = "abort"
-
-
-
-[dependencies.openssl-sys]
-version = "0.9"
-features = ["vendored"]
-

@@ -92,6 +92,7 @@ fn print_banner(mode: &str, sqlite: &str, pg: &str, threads: usize) {
     label("SQLite",      sqlite,                 CYAN);
     label("Postgres",    pg,                     CYAN);
     label("Lookup",      "AHashSet (in-memory)", GREEN);
+    label("DB Insert",   "Instant (in-worker)",  GREEN);  // ← new info line
     label("Started",     &Local::now().format("%Y-%m-%d %H:%M:%S").to_string(), GREEN);
     hline();
     blank();
@@ -155,10 +156,13 @@ struct LastProcessed {
     addresses: Vec<AddrRecord>,
 }
 
+/// Shared PostgreSQL client type alias
+type PgClient = Arc<Mutex<Client>>;
+
 /// Optimized generation: takes pre-computed PublicKey to avoid redundant EC multiplications
 fn generate_single(
     pk:      &PrivateKey,
-    pubkey:  &PublicKey, // Pre-calculated for speed
+    pubkey:  &PublicKey,
     secp:    &Secp256k1<bitcoin::secp256k1::All>,
     path:    &str,
     purpose: u32,
@@ -170,8 +174,8 @@ fn generate_single(
         44 => AddrRecord {
             addr_type: "P2PKH",
             address: Address::p2pkh(pubkey, net).to_string(),
-            derivation_path: path.to_string(), 
-            wif: pk.to_wif(), 
+            derivation_path: path.to_string(),
+            wif: pk.to_wif(),
             pubkey_hex,
         },
         49 => {
@@ -179,27 +183,27 @@ fn generate_single(
             let wpkh  = pubkey.wpubkey_hash()?;
             let inner = ScriptBuf::new_p2wpkh(&wpkh);
             let addr  = Address::p2sh(&inner, net).ok()?;
-            AddrRecord { 
+            AddrRecord {
                 addr_type: "P2SH-P2WPKH",
-                address: addr.to_string(), 
-                derivation_path: path.to_string(), 
-                wif: pk.to_wif(), 
-                pubkey_hex 
+                address: addr.to_string(),
+                derivation_path: path.to_string(),
+                wif: pk.to_wif(),
+                pubkey_hex
             }
         },
         84 => {
             if !pubkey.compressed { return None; }
             let addr = Address::p2wpkh(pubkey, net).ok()?;
-            AddrRecord { 
+            AddrRecord {
                 addr_type: "P2WPKH",
-                address: addr.to_string(), 
-                derivation_path: path.to_string(), 
-                wif: pk.to_wif(), 
-                pubkey_hex 
+                address: addr.to_string(),
+                derivation_path: path.to_string(),
+                wif: pk.to_wif(),
+                pubkey_hex
             }
         },
         86 => {
-            // Internal (untweaked) x-only pubkey — this is what the user's wallet holds
+            // Internal (untweaked) x-only pubkey
             let xonly_internal = XOnlyPublicKey::from(pubkey.inner);
 
             // BIP-341 key-path tweak: Q = P + hash(P)·G
@@ -211,10 +215,6 @@ fn generate_single(
                 TweakedPublicKey::dangerous_assume_tweaked(xonly_tweaked), net
             );
 
-            // ── What to display ────────────────────────────────────────────────
-            // WIF   → INTERNAL private key (what wallets import to spend P2TR)
-            // PubKey → INTERNAL x-only pubkey (32 bytes, no parity prefix)
-            //           matches the WIF and is the "internal key" shown by wallets
             AddrRecord {
                 addr_type: "P2TR",
                 address: addr.to_string(),
@@ -261,7 +261,7 @@ fn ensure_pg_table(c: &mut Client) -> Result<()> {
     c.execute(
         "CREATE TABLE IF NOT EXISTS found_addresses (
             id               SERIAL PRIMARY KEY,
-            address          TEXT NOT NULL,
+            address          TEXT NOT NULL UNIQUE,
             private_key      TEXT NOT NULL,
             mnemonic         TEXT,
             derivation_path  TEXT NOT NULL,
@@ -343,7 +343,7 @@ fn print_report(total: u64, hits: u64, elapsed: Duration,
     last_processed: &LastProcessed, threads: usize)
 {
     clear_status_line();
-    
+
     blank();
     dline();
     println!("  {BOLD}{CYAN}◈  SCAN REPORT  ◈{RESET}");
@@ -351,7 +351,7 @@ fn print_report(total: u64, hits: u64, elapsed: Duration,
 
     println!("  {BOLD}{WHITE}Statistics{RESET}");
     hline();
-    
+
     label("Keys scanned",   &format_big(total),                              GREEN);
     label("Matches found",  &hits.to_string(),
           if hits > 0 { GREEN } else { DIM });
@@ -363,7 +363,7 @@ fn print_report(total: u64, hits: u64, elapsed: Duration,
     blank();
     println!("  {BOLD}{WHITE}Last Processed Entity{RESET}");
     hline();
-    
+
     if let Some(ref m) = last_processed.mnemonic {
         label("Mnemonic", m, YELLOW);
     } else {
@@ -384,24 +384,18 @@ fn print_report(total: u64, hits: u64, elapsed: Duration,
             _             => WHITE,
         };
         let badge = format!("{BG_BLUE}{BOLD} {:<12} {RESET}", rec.addr_type);
-        
-        // Line 1: Type & Address
+
         println!("  {badge}  {color}{}{RESET}", rec.address);
-        
-        // Line 2: Path
         println!("    {DIM}Path: {}{RESET}", rec.derivation_path);
-        
-        // Line 3: Full Public Key
         println!("    {DIM}Pub:  {}{RESET}", rec.pubkey_hex);
-        
-        // Line 4: Full Private Key (WIF)
         println!("    {DIM}Priv: {}{RESET}", rec.wif);
     }
-    
+
     if last_processed.addresses.len() > 5 {
-        println!("  {DIM}  … and {} more addresses in this batch{RESET}", last_processed.addresses.len() - 5);
+        println!("  {DIM}  … and {} more addresses in this batch{RESET}",
+            last_processed.addresses.len() - 5);
     }
-    
+
     dline();
     blank();
 }
@@ -421,46 +415,81 @@ fn mnemonic_to_seed(m: &Mnemonic) -> Vec<u8> { m.to_seed("").to_vec() }
 
 type LastProcessedSender = Arc<Mutex<LastProcessed>>;
 
-fn update_last_processed(sender: &LastProcessedSender, mnemonic: Option<String>, addresses: Vec<AddrRecord>) {
+fn update_last_processed(
+    sender:    &LastProcessedSender,
+    mnemonic:  Option<String>,
+    addresses: Vec<AddrRecord>,
+) {
     if let Ok(mut guard) = sender.try_lock() {
         if !addresses.is_empty() {
-            guard.mnemonic = mnemonic;
+            guard.mnemonic  = mnemonic;
             guard.addresses = addresses;
         }
     }
 }
 
-/// Single random key check - OPTIMIZED
+// ─────────────────────────────────────────────────────────────────────────────
+// FIX: helper — insert to PG immediately inside the worker, then notify UI
+// ─────────────────────────────────────────────────────────────────────────────
+fn instant_save_and_notify(
+    pg:      &PgClient,
+    hit_tx:  &Sender<Hit>,
+    record:  AddrRecord,
+    mnemonic: Option<String>,
+) {
+    // 1. Write to PostgreSQL INSTANTLY — before moving to the next key
+    if let Ok(ref mut client) = pg.lock() {
+        if let Err(e) = insert_found(
+            client,
+            &record.address,
+            &record.wif,
+            mnemonic.as_deref(),
+            &record.derivation_path,
+            record.addr_type,
+        ) {
+            eprintln!("  {RED}[DB ERROR] Failed to insert hit: {e}{RESET}");
+        }
+    }
+
+    // 2. Send to main thread for UI display only (non-blocking)
+    let _ = hit_tx.send(Hit { record, mnemonic });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Single random key check — FIXED: instant DB insert
+// ─────────────────────────────────────────────────────────────────────────────
 fn run_random_check(
     secp:     &Secp256k1<bitcoin::secp256k1::All>,
     addr_set: &AHashSet<String>,
     hit_tx:   &Sender<Hit>,
     last_tx:  &LastProcessedSender,
+    pg:       &PgClient,                           // ← NEW
 ) -> Vec<AddrRecord> {
     let mut seed = [0u8; 32];
     rand::thread_rng().fill(&mut seed);
-    
+
     let sk = match SecretKey::from_slice(&seed) { Ok(k) => k, Err(_) => return vec![] };
     let pk = PrivateKey::new(sk, Network::Bitcoin);
-    
-    // Optimization: Compute public key ONCE
+
+    // Compute public key ONCE
     let pubkey = pk.public_key(secp);
 
     let mut recs = Vec::with_capacity(5);
-    
-    // P2PKH, P2SH, P2WPKH, P2TR
+
+    // P2PKH, P2SH-P2WPKH, P2WPKH, P2TR
     for p in [44u32, 49, 84, 86] {
         if let Some(rec) = generate_single(&pk, &pubkey, secp, "brute_force", p) {
             if addr_set.contains(&rec.address) {
-                let _ = hit_tx.send(Hit { record: rec.clone(), mnemonic: None });
+                // ← FIXED: instant save + notify
+                instant_save_and_notify(pg, hit_tx, rec.clone(), None);
             }
             recs.push(rec);
         }
     }
 
     // P2WSH
-    let cs   = ScriptBuf::builder().push_key(&pubkey).push_opcode(OP_CHECKSIG).into_script();
-    let addr = Address::p2wsh(&cs, Network::Bitcoin);
+    let cs    = ScriptBuf::builder().push_key(&pubkey).push_opcode(OP_CHECKSIG).into_script();
+    let addr  = Address::p2wsh(&cs, Network::Bitcoin);
     let p2wsh = AddrRecord {
         addr_type: "P2WSH",
         address: addr.to_string(),
@@ -469,7 +498,8 @@ fn run_random_check(
         pubkey_hex: hex::encode(pubkey.to_bytes()),
     };
     if addr_set.contains(&p2wsh.address) {
-        let _ = hit_tx.send(Hit { record: p2wsh.clone(), mnemonic: None });
+        // ← FIXED: instant save + notify
+        instant_save_and_notify(pg, hit_tx, p2wsh.clone(), None);
     }
     recs.push(p2wsh);
 
@@ -477,7 +507,9 @@ fn run_random_check(
     recs
 }
 
-/// Single mnemonic check - OPTIMIZED
+// ─────────────────────────────────────────────────────────────────────────────
+// Single mnemonic check — FIXED: instant DB insert
+// ─────────────────────────────────────────────────────────────────────────────
 fn run_mnemonic_check(
     secp:         &Secp256k1<bitcoin::secp256k1::All>,
     addr_set:     &AHashSet<String>,
@@ -486,50 +518,61 @@ fn run_mnemonic_check(
     fixed_phrase: &Option<String>,
     words_config: usize,
     depth:        u32,
+    pg:           &PgClient,                       // ← NEW
 ) -> (Option<String>, Vec<AddrRecord>) {
     let (phrase, seed_vec) = if let Some(ref p) = fixed_phrase {
         let m = match Mnemonic::parse_in_normalized(Language::English, p) {
-            Ok(m) => m, Err(_) => return (Some(p.clone()), vec![])
+            Ok(m)  => m,
+            Err(_) => return (Some(p.clone()), vec![]),
         };
         (p.clone(), mnemonic_to_seed(&m))
     } else {
-        let words = if words_config == 0 { if rand::random() { 12 } else { 24 } } else { words_config };
-        let m = match random_mnemonic(words) { Ok(m) => m, Err(_) => return (None, vec![]) };
+        let words = if words_config == 0 {
+            if rand::random() { 12 } else { 24 }
+        } else {
+            words_config
+        };
+        let m = match random_mnemonic(words) {
+            Ok(m)  => m,
+            Err(_) => return (None, vec![]),
+        };
         let phrase = m.to_string();
         let seed   = mnemonic_to_seed(&m);
         (phrase, seed)
     };
 
     let master = match Xpriv::new_master(Network::Bitcoin, &seed_vec) {
-        Ok(m) => m, Err(_) => return (Some(phrase), vec![])
+        Ok(m)  => m,
+        Err(_) => return (Some(phrase), vec![]),
     };
 
     let mut recs = Vec::new();
     for idx in 0..depth {
         for purpose in [44u32, 49, 84, 86] {
             let path_str = format!("m/{purpose}'/0'/0'/0/{idx}");
-            let path = match DerivationPath::from_str(&path_str) { Ok(p) => p, Err(_) => continue };
-            let child = match master.derive_priv(secp, &path) { Ok(c) => c, Err(_) => continue };
+            let path  = match DerivationPath::from_str(&path_str) { Ok(p) => p, Err(_) => continue };
+            let child = match master.derive_priv(secp, &path)      { Ok(c) => c, Err(_) => continue };
             let pk    = child.to_priv();
-            
-            // Optimization: Compute public key ONCE
+
+            // Compute public key ONCE
             let pubkey = pk.public_key(secp);
-            
+
             if let Some(rec) = generate_single(&pk, &pubkey, secp, &path_str, purpose) {
                 if addr_set.contains(&rec.address) {
-                    let _ = hit_tx.send(Hit { record: rec.clone(), mnemonic: Some(phrase.clone()) });
+                    // ← FIXED: instant save + notify
+                    instant_save_and_notify(pg, hit_tx, rec.clone(), Some(phrase.clone()));
                 }
                 recs.push(rec);
             }
         }
     }
-    
+
     update_last_processed(last_tx, Some(phrase.clone()), recs.clone());
     (Some(phrase), recs)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Worker thread body
+// Worker thread — FIXED: receives PgClient, passes to check functions
 // ─────────────────────────────────────────────────────────────────────────────
 fn worker(
     mode:     Mode,
@@ -538,24 +581,31 @@ fn worker(
     last_tx:  LastProcessedSender,
     counter:  Arc<AtomicU64>,
     running:  Arc<AtomicBool>,
+    pg:       PgClient,                            // ← NEW
 ) {
     let secp = Secp256k1::new();
 
     while running.load(Ordering::Relaxed) {
         match &mode {
             Mode::Random => {
-                run_random_check(&secp, &addr_set, &hit_tx, &last_tx);
+                run_random_check(&secp, &addr_set, &hit_tx, &last_tx, &pg);
                 counter.fetch_add(1, Ordering::Relaxed);
             }
             Mode::Mnemonic { mnemonic, words, depth } => {
-                run_mnemonic_check(&secp, &addr_set, &hit_tx, &last_tx, mnemonic, *words, *depth);
+                run_mnemonic_check(
+                    &secp, &addr_set, &hit_tx, &last_tx,
+                    mnemonic, *words, *depth, &pg,
+                );
                 counter.fetch_add(1, Ordering::Relaxed);
             }
             Mode::Mix { depth } => {
                 if rand::random() {
-                    run_mnemonic_check(&secp, &addr_set, &hit_tx, &last_tx, &None, 0, *depth);
+                    run_mnemonic_check(
+                        &secp, &addr_set, &hit_tx, &last_tx,
+                        &None, 0, *depth, &pg,
+                    );
                 } else {
-                    run_random_check(&secp, &addr_set, &hit_tx, &last_tx);
+                    run_random_check(&secp, &addr_set, &hit_tx, &last_tx, &pg);
                 }
                 counter.fetch_add(1, Ordering::Relaxed);
             }
@@ -591,7 +641,7 @@ fn start_command_thread(running: Arc<AtomicBool>) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// main
+// main — FIXED: pg_mutex shared to all workers
 // ─────────────────────────────────────────────────────────────────────────────
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -614,18 +664,18 @@ fn main() -> Result<()> {
     let _ = io::stdout().flush();
     let addr_set = Arc::new(load_address_set(&cli.sqlite)?);
 
-    // Create TLS connector for PostgreSQL
+    // TLS connector for PostgreSQL
     let mut builder = SslConnector::builder(SslMethod::tls())
         .with_context(|| "unable to create SSL connector builder")?;
-    // For Aiven Cloud or other managed PostgreSQL with self-signed certs
-    // Set to NONE for testing, or use set_ca_file() with their CA certificate for production
     builder.set_verify(SslVerifyMode::NONE);
     let connector = MakeTlsConnector::new(builder.build());
 
     let mut pg = Client::connect(&cli.pg, connector)
         .with_context(|| format!("Cannot connect PostgreSQL: {}", cli.pg))?;
     ensure_pg_table(&mut pg)?;
-    let pg_mutex = Arc::new(Mutex::new(pg));
+
+    // ← FIXED: pg_mutex is now shared to ALL worker threads
+    let pg_mutex: PgClient = Arc::new(Mutex::new(pg));
 
     println!("  {GREEN}✔  PostgreSQL connected{RESET}");
     println!("  {YELLOW}⟳  Spawning {num_threads} worker thread(s)…{RESET}");
@@ -645,13 +695,17 @@ fn main() -> Result<()> {
 
     let mut handles = vec![];
     for _ in 0..num_threads {
-        let mode     = cli.mode.clone();
-        let set      = Arc::clone(&addr_set);
-        let tx       = hit_tx.clone();
-        let ltx      = Arc::clone(&last_processed);
-        let cnt      = Arc::clone(&counter);
-        let run      = Arc::clone(&running);
-        handles.push(thread::spawn(move || worker(mode, set, tx, ltx, cnt, run)));
+        let mode   = cli.mode.clone();
+        let set    = Arc::clone(&addr_set);
+        let tx     = hit_tx.clone();
+        let ltx    = Arc::clone(&last_processed);
+        let cnt    = Arc::clone(&counter);
+        let run    = Arc::clone(&running);
+        let pg_arc = Arc::clone(&pg_mutex);        // ← NEW: pass pg to each worker
+
+        handles.push(thread::spawn(move || {
+            worker(mode, set, tx, ltx, cnt, run, pg_arc)
+        }));
     }
     drop(hit_tx);
 
@@ -659,16 +713,11 @@ fn main() -> Result<()> {
     let mut last_total = 0u64;
 
     loop {
+        // ← FIXED: channel is UI-only now — DB insert already happened in worker
         while let Ok(hit) = hit_rx.try_recv() {
             hits_ctr.fetch_add(1, Ordering::Relaxed);
             print_found(&hit);
-            if let Ok(ref mut pg) = pg_mutex.lock() {
-                let _ = insert_found(
-                    pg, &hit.record.address, &hit.record.wif,
-                    hit.mnemonic.as_deref(),
-                    &hit.record.derivation_path, hit.record.addr_type,
-                );
-            }
+            // insert_found() is NO LONGER called here — already done instantly in worker
         }
 
         let total   = counter.load(Ordering::Relaxed);
