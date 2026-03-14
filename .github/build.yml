@@ -1,0 +1,51 @@
+name: Run BTC Scanner with R2 database
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:   # allow manual trigger
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Install AWS CLI v2
+        run: |
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          unzip awscliv2.zip
+          sudo ./aws/install
+          aws --version
+
+      - name: Configure AWS CLI for R2
+        run: |
+          aws configure set aws_access_key_id ${{ secrets.R2_ACCESS_KEY_ID }}
+          aws configure set aws_secret_access_key ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          aws configure set region auto
+        # The endpoint will be set per command via --endpoint-url
+
+      - name: Download SQLite database from R2
+        run: |
+          aws s3 cp s3://${{ secrets.R2_BUCKET }}/addresses_20260313_165617.db \
+            ./addresses_20260313_165617.db \
+            --endpoint-url ${{ secrets.R2_ENDPOINT }}
+
+      - name: Run btc-scanner
+        run: |
+          ./target/release/btc-scanner \
+            --sqlite addresses_20260313_165617.db \
+            --pg "${{ secrets.PG_CONNECTION_STRING }}" \
+            --threads 8 \
+            mix
