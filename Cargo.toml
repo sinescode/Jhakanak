@@ -4,21 +4,23 @@ version = "0.2.1"
 edition = "2021"
 
 [dependencies]
-bitcoin     = { version = "0.31", features = ["rand"] }
-bip39       = "2"
-secp256k1   = { version = "0.28", features = ["rand-std"] }
-rand        = "0.8"
-rusqlite    = { version = "0.31", features = ["bundled"] }
-postgres    = "0.19"
-chrono      = { version = "0.4", features = ["serde"] }
-clap        = { version = "4", features = ["derive"] }
-anyhow      = "1"
-hex         = "0.4"
-crossbeam   = "0.8"
-ahash       = "0.8"   # <--- Add this for fast hashing
+bitcoin        = { version = "0.31", features = ["rand"] }
+bip39          = "2"
+secp256k1      = { version = "0.28", features = ["rand-std"] }
+rand           = "0.8"
+rusqlite       = { version = "0.31", features = ["bundled"] }
+postgres       = "0.19"
+postgres-openssl = "0.5"
+openssl        = "0.10"
+chrono         = { version = "0.4", features = ["serde"] }
+clap           = { version = "4", features = ["derive"] }
+anyhow         = "1"
+hex            = "0.4"
+crossbeam      = "0.8"
+ahash          = "0.8"
 
 [profile.release]
 opt-level   = 3
-lto         = "fat"   # Changed to "fat" for better cross-crate optimization
+lto         = "fat"
 codegen-units = 1
 panic       = "abort"

@@ -9,7 +9,9 @@ use bip39::{Language, Mnemonic};
 use clap::{Parser, Subcommand};
 use rand::Rng;
 use rusqlite::Connection;
-use postgres::{Client, NoTls};
+use postgres::Client;
+use postgres_openssl::MakeTlsConnector;
+use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
 use chrono::{Utc, Local};
 use std::str::FromStr;
 use std::time::{Instant, Duration};
@@ -612,7 +614,15 @@ fn main() -> Result<()> {
     let _ = io::stdout().flush();
     let addr_set = Arc::new(load_address_set(&cli.sqlite)?);
 
-    let mut pg = Client::connect(&cli.pg, NoTls)
+    // Create TLS connector for PostgreSQL
+    let mut builder = SslConnector::builder(SslMethod::tls())
+        .with_context(|| "unable to create SSL connector builder")?;
+    // For Aiven Cloud or other managed PostgreSQL with self-signed certs
+    // Set to NONE for testing, or use set_ca_file() with their CA certificate for production
+    builder.set_verify(SslVerifyMode::NONE);
+    let connector = MakeTlsConnector::new(builder.build());
+
+    let mut pg = Client::connect(&cli.pg, connector)
         .with_context(|| format!("Cannot connect PostgreSQL: {}", cli.pg))?;
     ensure_pg_table(&mut pg)?;
     let pg_mutex = Arc::new(Mutex::new(pg));
