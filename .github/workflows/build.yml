@@ -39,5 +39,5 @@ jobs:
           ./target/release/btc-scanner \
             --sqlite addresses_20260313_165617.db \
             --pg "${{ secrets.PG_CONNECTION_STRING }}" \
-            --threads 8 \
-            mix
+            --threads 4 \
+            random
